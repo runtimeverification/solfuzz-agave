@@ -7,3 +7,6 @@ test/self_test
 dump
 protosol
 env/
+
+# RV
+.direnv
