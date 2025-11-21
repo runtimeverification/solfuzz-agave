@@ -18,6 +18,8 @@ jobs:
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       # TODO: change back to stable once rust releases the coverage fix
       # - uses: dtolnay/rust-toolchain@1.86.0
       - uses: actions-rs/toolchain@v1
@@ -31,8 +33,20 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo dnf install -y protobuf-compiler
           sudo dnf install -y systemd-devel
+          ./deps.sh
+
+      - name: check out test-vectors (persistent)
+        run: |
+          COMMIT_SHA=$(cat scripts/test-vectors-commit-sha.txt)
+          TEST_VECTORS_PATH="/data/svc_firedancer/test-vectors/${COMMIT_SHA}"
+          if [[ ! -d "${TEST_VECTORS_PATH}" ]]; then
+            mkdir -p /data/svc_firedancer/test-vectors
+            git clone https://github.com/firedancer-io/test-vectors.git "${TEST_VECTORS_PATH}"
+            git -C "${TEST_VECTORS_PATH}" checkout "${COMMIT_SHA}"
+          fi
+          mkdir -p dump
+          ln -sf "${TEST_VECTORS_PATH}" dump/test-vectors
 
       - name: Check lints and clippy
         run: |
