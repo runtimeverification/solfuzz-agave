@@ -21,6 +21,13 @@ pkgs.mkShell {
   CXX = "${pkgs.stdenv.cc}/bin/c++";
   PROTOC = "${pkgs.protobuf}/bin/protoc";
   
+  # Ensure cargo build scripts can find protoc
+  # This is critical for dependencies like protosol that use prost-build
+  PROTOC_INCLUDE = "${pkgs.protobuf}/include";
+  # protosol's build.rs looks for PROTOC_EXECUTABLE or PROTOSOL_PROTOC
+  PROTOC_EXECUTABLE = "${pkgs.protobuf}/bin/protoc";
+  PROTOSOL_PROTOC = "${pkgs.protobuf}/bin/protoc";
+  
   # When cc crate uses clang, it needs to know where to find system headers
   # Point to clang's resource dir for compiler intrinsics, glibc for standard C headers, and udev for libudev.h
   CFLAGS = "-isystem ${pkgs.llvmPackages.libclang.lib}/lib/clang/${pkgs.lib.versions.major pkgs.llvmPackages.libclang.version}/include -isystem ${pkgs.glibc.dev}/include -isystem ${pkgs.systemd.dev}/include";
@@ -40,13 +47,14 @@ pkgs.mkShell {
     echo "shell.nix: CC=$CC" 
     echo "shell.nix: CXX=$CXX" 
     echo "shell.nix: PROTOC=$PROTOC"
+    echo "shell.nix: PROTOC_INCLUDE=$PROTOC_INCLUDE"
     echo "shell.nix: OPENSSL_DIR=$OPENSSL_DIR"
     echo "shell.nix: Using stdenv compiler wrapper which handles all paths automatically"
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "🔨 Solfuzz-agave Development Environment"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "Read to build! Run:"
+    echo "Ready to build! Run:"
     echo "  make build"
   '';
 
