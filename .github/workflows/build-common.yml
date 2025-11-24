@@ -14,7 +14,7 @@ jobs:
     name: cargo check + test
     runs-on: [self-hosted]
     concurrency:
-      group: on-pull-request_${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      group: on-pull-request_test_${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
@@ -27,34 +27,17 @@ jobs:
           toolchain: nightly-2025-10-30
           override: true
           components: "clippy, rustfmt"
+
       - uses: Swatinem/rust-cache@v2
         with:
           cache-all-crates: true # we do this because we have a crapload of crates used for testing/CI
 
-      - name: Install dependencies
-        run: |
-          sudo dnf install -y systemd-devel
-          ./deps.sh
-
-      - name: check out test-vectors (persistent)
-        run: |
-          COMMIT_SHA=$(cat scripts/test-vectors-commit-sha.txt)
-          TEST_VECTORS_PATH="/data/svc_firedancer/test-vectors/${COMMIT_SHA}"
-          if [[ ! -d "${TEST_VECTORS_PATH}" ]]; then
-            mkdir -p /data/svc_firedancer/test-vectors
-            git clone https://github.com/firedancer-io/test-vectors.git "${TEST_VECTORS_PATH}"
-            git -C "${TEST_VECTORS_PATH}" checkout "${COMMIT_SHA}"
-          fi
-          mkdir -p dump
-          ln -sf "${TEST_VECTORS_PATH}" dump/test-vectors
+      - uses: ./.github/actions/deps
 
       - name: Check lints and clippy
         run: |
           cargo fmt --all -- --check
           cargo clippy --all -- -D warnings
-
-      - name: Make binaries
-        run: make binaries
 
       - name: Log Cargo.toml
         run: |
@@ -68,16 +51,13 @@ jobs:
           cat Cargo.lock
           echo "=================="
 
-      - name: Run test-vectors
-        run: |
-          ./scripts/run_test_vectors.sh
-
       - name: Run cargo check + test
         run: |
           cargo check --release
           cargo test --release
 
       - name: Build shared objects
+        if: ${{ inputs.upload_artifacts }}
         run: make shared_obj
 
       - name: Build cov-enabled shared objects
@@ -96,3 +76,47 @@ jobs:
             ./target/x86_64-unknown-linux-gnu/release/libsolfuzz_agave.so
             ./target/x86_64-unknown-linux-gnu/release/libsolfuzz_agave+cov.so
             ./target/x86_64-unknown-linux-gnu/release/libsolfuzz_agave_src/
+
+  test-vectors:
+    name: run test vectors
+    runs-on: [self-hosted]
+    concurrency:
+      group: on-pull-request_test-vectors_${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # TODO: change back to stable once rust releases the coverage fix
+      # - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly-2025-10-30
+          override: true
+          components: "clippy, rustfmt"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true # we do this because we have a crapload of crates used for testing/CI
+
+      - uses: ./.github/actions/deps
+
+      - name: check out test-vectors (persistent)
+        run: |
+          COMMIT_SHA=$(cat scripts/test-vectors-commit-sha.txt)
+          TEST_VECTORS_PATH="/data/svc_firedancer/test-vectors/${COMMIT_SHA}"
+          if [[ ! -d "${TEST_VECTORS_PATH}" ]]; then
+            mkdir -p /data/svc_firedancer/test-vectors
+            git clone https://github.com/firedancer-io/test-vectors.git "${TEST_VECTORS_PATH}"
+            git -C "${TEST_VECTORS_PATH}" checkout "${COMMIT_SHA}"
+          fi
+          mkdir -p dump
+          ln -sf "${TEST_VECTORS_PATH}" dump/test-vectors
+
+      - name: Make binaries
+        run: make binaries
+
+      - name: Run test-vectors
+        run: |
+          ./scripts/run_test_vectors.sh

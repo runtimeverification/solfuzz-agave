@@ -27,6 +27,7 @@ use solana_ledger::blockstore_processor::{
     confirm_slot_entries, create_thread_pool, ConfirmationProgress, ConfirmationTiming,
 };
 use solana_ledger::leader_schedule_cache::LeaderScheduleCache;
+use solana_ledger::leader_schedule_utils;
 use solana_poh_config::PohConfig;
 use solana_pubkey::Pubkey;
 use solana_rent::Rent;
@@ -405,23 +406,23 @@ pub fn execute_block(context: BlockContext) -> Option<BlockEffects> {
     ancestors.insert(current_slot.saturating_sub(1), 1);
     ancestors.insert(current_slot, 1);
 
-    /* Accounts DB config and initialization */
+    /* Accounts DB config and initialization. Agave v3.1 uses a new Accounts
+    interface, which is not compatible with the old one. */
     let index = Some(AccountsIndexConfig {
         bins: Some(2),
         num_flush_threads: Some(NonZeroUsize::new(1).unwrap()),
         index_limit_mb: IndexLimitMb::InMemOnly,
         ..AccountsIndexConfig::default()
     });
-    let accounts_db_config = Some(AccountsDbConfig {
+    let accounts_db_config = AccountsDbConfig {
         index,
         storage_access: StorageAccess::File,
         skip_initial_hash_calc: true,
-        num_hash_threads: Some(NonZeroUsize::new(1).unwrap()),
         ..AccountsDbConfig::default()
-    });
+    };
     let accounts_db = AccountsDb::new_with_config(
         vec![],
-        accounts_db_config,
+        accounts_db_config.clone(),
         None,
         Arc::new(AtomicBool::new(false)),
     );
@@ -435,10 +436,16 @@ pub fn execute_block(context: BlockContext) -> Option<BlockEffects> {
             (pubkey, account_data)
         })
         .collect::<Vec<_>>();
-    accounts.store_accounts_seq(
-        (current_slot.saturating_sub(1), &accounts_to_store[..]),
-        None,
-    );
+
+    let storage_slot = slot_ctx.prev_slot;
+    accounts.store_accounts_seq((storage_slot, &accounts_to_store[..]), None);
+    // Add the root slot to the accounts DB
+    // Now needed when calling Bank::new_from_snapshot() in Agave v3.1
+    accounts.accounts_db.add_root(storage_slot);
+    let accounts_data_size_initial: u64 = accounts_to_store
+        .iter()
+        .map(|(_, account)| account.data().len() as u64)
+        .sum();
 
     /* Build the stakes separately */
     let current_epoch = epoch_schedule.get_epoch(current_slot);
@@ -462,24 +469,6 @@ pub fn execute_block(context: BlockContext) -> Option<BlockEffects> {
         VersionedEpochStakes::new(
             SerdeStakesToStakeFormat::from(stakes_t_1.clone()),
             leader_schedule_epoch,
-        ),
-    );
-
-    let stakes_current_accounts = Stakes::new(&stakes_t, |pubkey| {
-        context
-            .acct_states
-            .iter()
-            .find(|acct| {
-                Pubkey::new_from_array(acct.address.clone().try_into().unwrap()) == *pubkey
-            })
-            .map(AccountSharedData::from)
-    })
-    .unwrap();
-    epoch_stakes.insert(
-        leader_schedule_epoch.saturating_add(1),
-        VersionedEpochStakes::new(
-            SerdeStakesToStakeFormat::from(stakes_current_accounts),
-            leader_schedule_epoch.saturating_add(1),
         ),
     );
 
@@ -543,23 +532,21 @@ pub fn execute_block(context: BlockContext) -> Option<BlockEffects> {
     };
 
     let bank_rc = BankRc::new(accounts);
-    let mut bank = Bank::new_from_fields(
+    let mut bank = Bank::new_from_snapshot(
         bank_rc,
         &genesis_config,
         Arc::new(RuntimeConfig::default()),
         bank_fields,
         None,
-        None,
-        false,
-        0,
+        accounts_data_size_initial, // precomputed above
         Some(feature_set),
     );
 
-    // Seed initial accounts into the bank
-    for account in &context.acct_states {
-        let pubkey = Pubkey::new_from_array(account.address.clone().try_into().unwrap());
-        let account_data = AccountSharedData::from(account);
-        bank.store_account(&pubkey, &account_data);
+    // Store the accounts in the bank using the new interface.
+    for (pubkey, account_data) in &accounts_to_store {
+        if account_data.lamports() > 0 {
+            bank.store_account(pubkey, account_data);
+        }
     }
 
     let leader_schedule = LeaderScheduleCache::new_from_bank(&bank);
@@ -577,10 +564,12 @@ pub fn execute_block(context: BlockContext) -> Option<BlockEffects> {
             null_tracer(),
         );
     }
+    let l_sched = leader_schedule_utils::leader_schedule(current_epoch, &bank).unwrap();
 
     bank.distribute_partitioned_epoch_rewards();
 
     bank.get_transaction_processor().reset_sysvar_cache();
+
     bank.update_slot_hashes();
     bank.update_stake_history(Some(parent_epoch));
     bank.update_clock(Some(parent_epoch));
@@ -686,54 +675,53 @@ pub fn execute_block(context: BlockContext) -> Option<BlockEffects> {
     // - leader_schedule_epoch: The epoch for which the leader schedule applies
     // - first_slot: The absolute slot number where this epoch begins
     // - slots_in_epoch: Total number of slots in this epoch (can vary by epoch)
-    let first_slot = epoch_schedule_for_effects.get_first_slot_in_epoch(leader_schedule_epoch);
-    let slots_in_epoch = epoch_schedule_for_effects.get_slots_in_epoch(leader_schedule_epoch);
+    let first_slot = epoch_schedule_for_effects.get_first_slot_in_epoch(current_epoch);
+    let slots_in_epoch = epoch_schedule_for_effects.get_slots_in_epoch(current_epoch);
 
     // Attempt to retrieve the leader schedule for this epoch from the cache
-    let leader_schedule_effects =
-        if let Some(schedule) = leader_schedule.get_epoch_leader_schedule(leader_schedule_epoch) {
-            // Schedule found, obtain effects and hash
-            // Generate a deterministic 128-bit hash of the entire leader schedule
-            // This hash encodes both WHO the leaders are and WHEN they lead.
-            // We use a fixed seed for reproducibility across implementations.
-            let mut schedule_hash = [0u8; 16];
-            let schedule_pubkeys: Vec<Pubkey> = (0..slots_in_epoch)
-                .map(|slot_offset| schedule[slot_offset])
-                .collect();
 
-            let unique_cnt = hash_epoch_leaders(
-                &schedule_pubkeys,
-                LEADER_SCHEDULE_HASH_SEED,
-                &mut schedule_hash,
-            );
+    // Schedule found, obtain effects and hash
+    // Generate a deterministic 128-bit hash of the entire leader schedule
+    // This hash encodes both WHO the leaders are and WHEN they lead.
+    // We use a fixed seed for reproducibility across implementations.
+    let mut schedule_hash = [0u8; 16];
+    let schedule_pubkeys: Vec<Pubkey> = (0..slots_in_epoch)
+        .map(|slot_offset| l_sched[slot_offset])
+        .collect();
 
-            // Package all the schedule metadata for output
-            proto::LeaderScheduleEffects {
-                leaders_epoch: leader_schedule_epoch, // Which epoch this schedule applies to
-                leaders_slot0: first_slot,            // First absolute slot in this epoch
-                leaders_slot_cnt: slots_in_epoch as u64, // Total slots in this epoch
-                leader_pub_cnt: unique_cnt as u64,    // Number of unique leader validators
-                leaders_sched_cnt: slots_in_epoch as u64, // Number of scheduled leader slots (verification field)
-                leader_schedule_hash: schedule_hash.to_vec(), // 128-bit fingerprint of the schedule
-            }
-        } else {
-            // No schedule found for this epoch, return empty/zero values
-            // This can happen during bootstrapping or if the epoch is too far in the future
-            proto::LeaderScheduleEffects {
-                leaders_epoch: 0,
-                leaders_slot0: 0,
-                leaders_slot_cnt: 0,
-                leader_pub_cnt: 0,
-                leaders_sched_cnt: 0,
-                leader_schedule_hash: vec![],
-            }
-        };
+    let unique_cnt = hash_epoch_leaders(
+        &schedule_pubkeys,
+        LEADER_SCHEDULE_HASH_SEED,
+        &mut schedule_hash,
+    );
+
+    // Package all the schedule metadata for output
+    let leader_schedule_effects = proto::LeaderScheduleEffects {
+        leaders_epoch: current_epoch, // Which epoch this schedule applies to
+        leaders_slot0: first_slot,    // First absolute slot in this epoch
+        leaders_slot_cnt: slots_in_epoch as u64, // Total slots in this epoch
+        leader_pub_cnt: unique_cnt as u64, // Number of unique leader validators
+        leaders_sched_cnt: slots_in_epoch as u64, // Number of scheduled leader slots (verification field)
+        leader_schedule_hash: schedule_hash.to_vec(), // 128-bit fingerprint of the schedule
+    };
+
+    let bank_hash = if result.is_err() {
+        Hash::default()
+    } else {
+        no_schedule_bank.hash()
+    };
+
+    let capitalization = if result.is_err() {
+        0
+    } else {
+        no_schedule_bank.capitalization()
+    };
 
     // Then include in the output
     Some(BlockEffects {
         has_error: result.is_err(),
-        slot_capitalization: no_schedule_bank.capitalization(),
-        bank_hash: no_schedule_bank.hash().to_bytes().to_vec(),
+        slot_capitalization: capitalization,
+        bank_hash: bank_hash.to_bytes().to_vec(),
         cost_tracker: Some(proto::CostTracker {
             block_cost: cost_tracker.block_cost(),
             vote_cost: cost_tracker.vote_cost(),
